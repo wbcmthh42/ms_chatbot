@@ -2,7 +2,7 @@ $schema: https://azuremlschemas.azureedge.net/latest/azureBlob.schema.json
 name: my_ds # your datstore name here
 type: azure_blob
 description: Data store for index preparation # your description here
-account_name: mystorageaccount # your storage account name here
-container_name: mystoragecontainer # your container name here
+account_name: ladpworkstorage160fd25f8 # your storage account name here
+container_name: pdf-doc-vgc # your container name here
 credentials: 
-  account_key: # account key here
+  account_key: RjruMJhums3j4iyT4XvYVFgdq27wyLPlKWTmhQ14sOAzSeB0tVc5 # account key here

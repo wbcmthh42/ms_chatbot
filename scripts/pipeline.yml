@@ -17,8 +17,8 @@ inputs:
     path: aml_config.json # your config file name here
   input_data_path:
     type: uri_folder
-    # path: ../data # uncomment this to use local data
-    path: azureml://datastores/<datastore name>/paths/<path> # substitute your datastore name and path here
+    path: ../data # uncomment this to use local data
+    # path: azureml://datastores/<datastore name>/paths/<path> # substitute your datastore name and path here
     mode: ro_mount
 
 jobs:

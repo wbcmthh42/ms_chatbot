@@ -35,6 +35,9 @@ from backend.utils import (
     convert_to_pf_format,
     format_pf_non_streaming_response,
 )
+import matplotlib.pyplot as plt
+import io
+import base64
 
 bp = Blueprint("routes", __name__, static_folder="static", template_folder="static")
 
@@ -335,6 +338,29 @@ async def promptflow_request(request):
         logging.error(f"An error occurred while making promptflow_request: {e}")
 
 
+async def execute_python_plot(code: str):
+    try:
+        # Create a new figure
+        plt.figure()
+        
+        # Execute the plotting code
+        exec(code)
+        
+        # Save the plot to a bytes buffer
+        buffer = io.BytesIO()
+        plt.savefig(buffer, format='png')
+        plt.close()  # Close the figure to free memory
+        
+        # Convert to base64 string
+        buffer.seek(0)
+        image_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+        
+        return f"data:image/png;base64,{image_base64}"
+    except Exception as e:
+        logging.exception("Error executing plot code")
+        return str(e)
+
+
 async def send_chat_request(request_body, request_headers):
     filtered_messages = []
     messages = request_body.get("messages", [])
@@ -348,13 +374,26 @@ async def send_chat_request(request_body, request_headers):
     try:
         azure_openai_client = await init_openai_client()
         raw_response = await azure_openai_client.chat.completions.with_raw_response.create(**model_args)
+        apim_request_id = raw_response.headers.get("apim-request-id")
+        
+        # Get the response object
         response = raw_response.parse()
-        apim_request_id = raw_response.headers.get("apim-request-id") 
+        
+        # If streaming is enabled, return the response directly
+        if model_args.get('stream', False):
+            return response, apim_request_id
+            
+        # For non-streaming responses, handle plot generation
+        if hasattr(response, 'choices') and response.choices:
+            content = response.choices[0].message.content
+            if "plt.show()" in content and "import" in content:
+                image_data = await execute_python_plot(content)
+                response.choices[0].message.content += f"\n\n![Plot]({image_data})"
+            
+        return response, apim_request_id
     except Exception as e:
         logging.exception("Exception in send_chat_request")
         raise e
-
-    return response, apim_request_id
 
 
 async def complete_chat_request(request_body, request_headers):
@@ -378,8 +417,37 @@ async def stream_chat_request(request_body, request_headers):
     history_metadata = request_body.get("history_metadata", {})
     
     async def generate():
-        async for completionChunk in response:
-            yield format_stream_response(completionChunk, history_metadata, apim_request_id)
+        buffer = ""
+        async for chunk in response:
+            # Get content from the chunk
+            if hasattr(chunk.choices[0], 'delta') and hasattr(chunk.choices[0].delta, 'content'):
+                content = chunk.choices[0].delta.content or ""
+                buffer += content
+                
+                # Check if this chunk completes a matplotlib code block
+                if "plt.show()" in buffer and "import matplotlib" in buffer:
+                    try:
+                        # Extract the complete code block
+                        code_lines = buffer.split('\n')
+                        code_block = []
+                        in_code_block = False
+                        
+                        for line in code_lines:
+                            if line.strip().startswith('```'):
+                                in_code_block = not in_code_block
+                                continue
+                            if in_code_block:
+                                code_block.append(line)
+                        
+                        if code_block:
+                            code = '\n'.join(code_block)
+                            image_data = await execute_python_plot(code)
+                            content += f"\n\n![Plot]({image_data})"
+                            chunk.choices[0].delta.content = content
+                    except Exception as e:
+                        logging.exception("Error generating plot")
+            
+            yield format_stream_response(chunk, history_metadata, apim_request_id)
 
     return generate()
 

@@ -75,36 +75,27 @@ def generateFilterString(userToken):
     return f"{AZURE_SEARCH_PERMITTED_GROUPS_COLUMN}/any(g:search.in(g, '{group_ids}'))"
 
 
-def format_non_streaming_response(chatCompletion, history_metadata, apim_request_id):
-    response_obj = {
-        "id": chatCompletion.id,
-        "model": chatCompletion.model,
-        "created": chatCompletion.created,
-        "object": chatCompletion.object,
-        "choices": [{"messages": []}],
-        "history_metadata": history_metadata,
-        "apim-request-id": apim_request_id,
+def format_non_streaming_response(chatCompletion, history_metadata={}, request_id=""):
+    return {
+        "id": chatCompletion.get("id"),
+        "model": chatCompletion.get("model"),
+        "created": chatCompletion.get("created"),
+        "object": chatCompletion.get("object"),
+        "choices": [
+            {
+                "messages": [
+                    {
+                        "role": choice["message"]["role"],
+                        "content": choice["message"]["content"],
+                    }
+                ],
+                "metadata": history_metadata,
+                "request_id": request_id
+            }
+            for choice in chatCompletion.get("choices", [])
+        ],
     }
 
-    if len(chatCompletion.choices) > 0:
-        message = chatCompletion.choices[0].message
-        if message:
-            if hasattr(message, "context"):
-                response_obj["choices"][0]["messages"].append(
-                    {
-                        "role": "tool",
-                        "content": json.dumps(message.context),
-                    }
-                )
-            response_obj["choices"][0]["messages"].append(
-                {
-                    "role": "assistant",
-                    "content": message.content,
-                }
-            )
-            return response_obj
-
-    return {}
 
 def format_stream_response(chatCompletionChunk, history_metadata, apim_request_id):
     response_obj = {

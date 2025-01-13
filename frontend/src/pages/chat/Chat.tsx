@@ -45,6 +45,30 @@ const enum messageStatus {
   Done = 'Done'
 }
 
+const isValidBase64Image = (str: string): boolean => {
+  // Check for both formats: with and without img tag
+  return (
+    (str.startsWith('data:image/') && str.includes('base64,')) ||
+    (str.startsWith('<img src=\'data:image/') && str.endsWith('\'>'))
+  );
+};
+
+const extractBase64FromImg = (str: string): string => {
+  // If it's already just the data URI, return as is
+  if (str.startsWith('data:image/')) {
+    return str;
+  }
+  // Extract data URI from img tag
+  const match = str.match(/src='([^']+)'/);
+  return match ? match[1] : str;
+};
+
+DOMPurify.setConfig({
+  ADD_TAGS: ['img'],
+  ADD_ATTR: ['src'],
+  ADD_DATA_URI_TAGS: ['img']
+});
+
 const Chat = () => {
   const appStateContext = useContext(AppStateContext)
   const ui = appStateContext?.state.frontendSettings?.ui
@@ -142,40 +166,69 @@ const Chat = () => {
   }
 
   const processResultMessage = (resultMessage: ChatMessage, userMessage: ChatMessage, conversationId?: string) => {
-    if (typeof resultMessage.content === "string" && resultMessage.content.includes('all_exec_results')) {
-      const parsedExecResults = JSON.parse(resultMessage.content) as AzureSqlServerExecResults
-      setExecResults(parsedExecResults.all_exec_results)
-      assistantMessage.context = JSON.stringify({
-        all_exec_results: parsedExecResults.all_exec_results
-      })
-    }
+    try {
+      if (typeof resultMessage.content === "string" && resultMessage.content.includes('all_exec_results')) {
+        const parsedExecResults = JSON.parse(resultMessage.content) as AzureSqlServerExecResults
+        setExecResults(parsedExecResults.all_exec_results)
+        assistantMessage.context = JSON.stringify({
+          all_exec_results: parsedExecResults.all_exec_results
+        })
+      }
 
-    if (resultMessage.role === ASSISTANT) {
-      setAnswerId(resultMessage.id)
-      assistantContent += resultMessage.content
-      assistantMessage = { ...assistantMessage, ...resultMessage }
-      assistantMessage.content = assistantContent
-
-      if (resultMessage.context) {
-        toolMessage = {
-          id: uuid(),
-          role: TOOL,
-          content: resultMessage.context,
-          date: new Date().toISOString()
+      if (resultMessage.role === TOOL && resultMessage.content) {
+        try {
+          const content = typeof resultMessage.content === 'string' 
+            ? JSON.parse(resultMessage.content)
+            : resultMessage.content;
+          
+          // Check if content is a base64 image
+          if (typeof content === 'string' && content.startsWith('data:image')) {
+            resultMessage.content = content; // Keep the base64 string as is
+          }
+          // Check for plot arguments
+          else if (content.function?.arguments) {
+            const args = JSON.parse(content.function.arguments);
+            if (args.plot_type && !args.y_values) {
+              resultMessage.content = "Error: Unable to generate plot due to missing data (y_values).";
+              resultMessage.role = ERROR;
+            }
+          }
+        } catch (e) {
+          console.error('Error parsing plot data:', e);
         }
       }
-    }
 
-    if (resultMessage.role === TOOL) toolMessage = resultMessage
+      if (resultMessage.role === ASSISTANT) {
+        setAnswerId(resultMessage.id)
+        assistantContent += resultMessage.content
+        assistantMessage = { ...assistantMessage, ...resultMessage }
+        assistantMessage.content = assistantContent
 
-    if (!conversationId) {
-      isEmpty(toolMessage)
-        ? setMessages([...messages, userMessage, assistantMessage])
-        : setMessages([...messages, userMessage, toolMessage, assistantMessage])
-    } else {
-      isEmpty(toolMessage)
-        ? setMessages([...messages, assistantMessage])
-        : setMessages([...messages, toolMessage, assistantMessage])
+        if (resultMessage.context) {
+          toolMessage = {
+            id: uuid(),
+            role: TOOL,
+            content: resultMessage.context,
+            date: new Date().toISOString()
+          }
+        }
+      }
+
+      if (resultMessage.role === TOOL) toolMessage = resultMessage
+
+      if (!conversationId) {
+        isEmpty(toolMessage)
+          ? setMessages([...messages, userMessage, assistantMessage])
+          : setMessages([...messages, userMessage, toolMessage, assistantMessage])
+      } else {
+        isEmpty(toolMessage)
+          ? setMessages([...messages, assistantMessage])
+          : setMessages([...messages, toolMessage, assistantMessage])
+      }
+    } catch (e) {
+      console.error('Error processing message:', e);
+      resultMessage.role = ERROR;
+      resultMessage.content = "Error: Failed to process the response. Please try again.";
     }
   }
 
@@ -807,18 +860,29 @@ const Chat = () => {
                       </div>
                     ) : answer.role === 'assistant' ? (
                       <div className={styles.chatMessageGpt}>
-                        {typeof answer.content === "string" && <Answer
-                          answer={{
-                            answer: answer.content,
-                            citations: parseCitationFromMessage(messages[index - 1]),
-                            generated_chart: parsePlotFromMessage(messages[index - 1]),
-                            message_id: answer.id,
-                            feedback: answer.feedback,
-                            exec_results: execResults
+                        {typeof answer.content === "string" && (
+                          <div className={styles.chatMessageContent}>
+                            <ReactMarkdown
+                              remarkPlugins={[remarkGfm]}
+                              rehypePlugins={[rehypeRaw]}
+                              components={{
+                                code: ({ node, inline, className, children, ...props }) => {
+                                  // ... existing code component logic ...
+                                }
+                              }}>
+                              {answer.content}
+                            </ReactMarkdown>
+                          </div>
+                        )}
+                      </div>
+                    ) : answer.role === 'tool' ? (
+                      <div className={styles.chatMessageGpt}>
+                        <div 
+                          className={styles.chatMessageContent}
+                          dangerouslySetInnerHTML={{
+                            __html: DOMPurify.sanitize(answer.content)
                           }}
-                          onCitationClicked={c => onShowCitation(c)}
-                          onExectResultClicked={() => onShowExecResult(answerId)}
-                        />}
+                        />
                       </div>
                     ) : answer.role === ERROR ? (
                       <div className={styles.chatMessageError}>
@@ -976,13 +1040,25 @@ const Chat = () => {
                 {activeCitation.title}
               </h5>
               <div tabIndex={0}>
-                <ReactMarkdown
-                  linkTarget="_blank"
-                  className={styles.citationPanelContent}
-                  children={DOMPurify.sanitize(activeCitation.content, { ALLOWED_TAGS: XSSAllowTags })}
-                  remarkPlugins={[remarkGfm]}
-                  rehypePlugins={[rehypeRaw]}
-                />
+                {activeCitation.content && isValidBase64Image(activeCitation.content) ? (
+                  <div className={styles.imageContainer}>
+                    <img 
+                      src={activeCitation.content} 
+                      alt="Citation content" 
+                      className={styles.generatedImage}
+                    />
+                  </div>
+                ) : (
+                  <div 
+                    className={styles.chatMessageContent}
+                    dangerouslySetInnerHTML={{
+                      __html: DOMPurify.sanitize(marked.parse(activeCitation.content), {
+                        USE_PROFILES: { html: true },
+                        ADD_ATTR: ['target']
+                      })
+                    }}
+                  />
+                )}
               </div>
             </Stack.Item>
           )}

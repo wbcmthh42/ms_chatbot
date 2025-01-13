@@ -1,0 +1,70 @@
+azd env set AZURE_OPENAI_RESOURCE gpt-4o-mini
+azd env set AZURE_OPENAI_RESOURCE_GROUP LADP-Experimentation
+azd env set AZURE_OPENAI_SKU_NAME S0
+azd env set AZURE_SEARCH_SERVICE ladp
+azd env set AZURE_SEARCH_SERVICE_RESOURCE_GROUP LADP-Experimentation
+azd env set AZURE_SEARCH_SKU_NAME standard
+azd env set AZURE_FORMRECOGNIZER_SERVICE ladp
+azd env set AZURE_FORMRECOGNIZER_SERVICE_RESOURCE_GROUP LADP-Experimentation
+azd env set AZURE_FORMRECOGNIZER_SKU_NAME S0
+
+azd env set AZURE_RESOURCE_GROUP LADP-Experimentation
+azd env set AZURE_LOCATION eastus
+
+
+cat .env | jq -R '. | capture("(?<name>[A-Z_]+)=(?<value>.*)")' | jq -s '.[].slotSetting=false' > env.json
+
+
+
+
+
+az webapp up --runtime PYTHON:3.11 --sku B1 --name ladp-app --resource-group LADP-Experimentation --location eastus --subscription de761375-8d25-4e32-8f26-918de2c8338c --track-status False
+
+az webapp config set --startup-file "python3 -m gunicorn app:app" --name ladp-app
+
+az webapp config appsettings set -g LADP-Experimentation -n ladp-app --settings WEBSITE_WEBDEPLOY_USE_SCM=false
+
+az webapp config appsettings set -g LADP-Experimentation -n ladp-app --settings "@env.json"
+
+
+
+# PDF Docs
+
+(azureai) tayjohnny@Tays-MacBook-Pro sample-app-aoai-chatGPT % az cognitiveservices account keys list --name "vgc-doc-intelligence3" --resource-group "LADP-Experimentation"
+
+{
+  "key1": "FuhYyEWefY40beyrhtphWmxMXthdndjfkpGN4hQ7eyNO5a41hAZGJQQJ99BAACYeBjFXJ3w3AAALACOGxVkE",
+  "key2": "99wc3RebsGlY6TxijZdvV7lRsNyS3fSlfTvYp357kS3NhEaBwQGuJQQJ99BAACYeBjFXJ3w3AAALACOGwK7p"
+}
+
+
+
+
+python scripts/data_preparation.py --config scripts/config.json --njobs=4 --form-rec-resource vgc-doc-intelligence3 --form-rec-key FuhYyEWefY40beyrhtphWmxMXthdndjfkpGN4hQ7eyNO5a41hAZGJQQJ99BAACYeBjFXJ3w3AAALACOGxVkE
+
+
+
+
+az ml workspace create \
+    --name "ladp-workspace" \
+    --resource-group "LADP-Experimentation" \
+    --location "eastus" 
+
+az ml datastore create --resource-group LADP-Experimentation --workspace-name ladp-workspace --file scripts/datastore.yml
+
+az ml job create --resource-group LADP-Experimentation --workspace-name ladp-workspace --file scripts/pipeline.yml
+
+
+
+Azure SQL Server
+pwd: Password123
+
+
+
+
+Authentication Not Configured
+This app does not have authentication configured. Please add an identity provider by finding your app in the Azure Portaland following these instructions (https://learn.microsoft.com/en-us/azure/app-service/scenario-secure-app-authentication-app-service?tabs=workforce-configuration#3-configure-authentication-and-authorization).
+Authentication configuration takes a few minutes to apply.
+If you deployed in the last 10 minutes, please wait and reload the page after 10 minutes.
+
+
