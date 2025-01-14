@@ -43,12 +43,16 @@ matplotlib.use('Agg')  # Must be called before importing pyplot
 import matplotlib.pyplot as plt
 import numpy as np
 import re
+import time
+from pathlib import Path
+import seaborn as sns
 
 bp = Blueprint("routes", __name__, static_folder="static", template_folder="static")
 
 cosmos_db_ready = asyncio.Event()
 
-CHARTS_DIR = os.path.join(os.path.dirname(__file__), "static", "charts")
+STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+CHARTS_DIR = os.path.join(STATIC_DIR, "assets", "charts")  # Move charts under assets
 os.makedirs(CHARTS_DIR, exist_ok=True)
 
 system_message = {
@@ -131,17 +135,32 @@ async def favicon():
 
 @bp.route("/assets/<path:path>")
 async def assets(path):
+    logging.info(f"[ASSETS DEBUG] Requesting asset: {path}")
+    if path.startswith('charts/'):
+        logging.info(f"[ASSETS DEBUG] Serving chart from: {CHARTS_DIR}")
+        chart_file = path.replace('charts/', '')
+        full_path = os.path.join(CHARTS_DIR, chart_file)
+        logging.info(f"[ASSETS DEBUG] Full path: {full_path}")
+        logging.info(f"[ASSETS DEBUG] File exists: {os.path.exists(full_path)}")
+        logging.info(f"[ASSETS DEBUG] Directory contents: {os.listdir(CHARTS_DIR)}")
+        try:
+            return await send_from_directory(CHARTS_DIR, chart_file)
+        except Exception as e:
+            logging.error(f"[ASSETS DEBUG] Error serving chart: {str(e)}")
+            return {"error": str(e)}, 404
     return await send_from_directory("static/assets", path)
 
 
 @bp.route("/assets/charts/<path:filename>")
 async def serve_chart(filename):
-    logging.debug(f"Attempting to serve chart: {filename}")
-    logging.debug(f"Charts directory: {CHARTS_DIR}")
     try:
-        return await send_from_directory(CHARTS_DIR, filename)
+        # Get the absolute path to the charts directory
+        charts_dir = os.path.join(os.path.dirname(__file__), 'static', 'assets', 'charts')
+        logging.info(f"[SERVE DEBUG] Serving chart: {filename} from {charts_dir}")
+        logging.info(f"[SERVE DEBUG] File exists: {os.path.exists(os.path.join(charts_dir, filename))}")
+        return await send_from_directory(charts_dir, filename)
     except Exception as e:
-        logging.error(f"Error serving chart {filename}: {str(e)}")
+        logging.error(f"[SERVE DEBUG] Error serving chart: {str(e)}")
         return {"error": str(e)}, 404
 
 
@@ -501,26 +520,24 @@ async def stream_chat_request(request_body, request_headers):
     response, apim_request_id = await send_chat_request(request_body, request_headers)
     history_metadata = request_body.get("history_metadata", {})
     
-    # Collect the full message while streaming
     full_message = ""
     
     async def generate():
         nonlocal full_message
         async for completionChunk in response:
             chunk_message = format_stream_response(completionChunk, history_metadata, apim_request_id)
-            # Collect the content
             if hasattr(completionChunk, 'choices') and completionChunk.choices:
                 content = completionChunk.choices[0].delta.content
                 if content:
                     full_message += content
             yield chunk_message
         
-        # After collecting all chunks, process the complete message for charts
+        # After collecting all chunks, process for charts
         if full_message:
-            logging.debug(f"Complete message collected: {full_message}")
-            # Process any code blocks in the complete message
+            logging.info(f"[CHART DEBUG] Processing complete message:\n{full_message}")
             code_block_matches = re.finditer(r'```(?:python)?\s*(.*?)```', full_message, re.DOTALL)
             
+            modified_message = full_message
             for match in code_block_matches:
                 code_block = match.group(1).strip()
                 if any(keyword in code_block for keyword in [
@@ -528,16 +545,30 @@ async def stream_chat_request(request_body, request_headers):
                     'plot(', 'scatter(', 'bar(', 'hist(', 
                     'figure(', 'title(', 'xlabel(', 'ylabel('
                 ]):
-                    logging.debug(f"Found plotting code: {code_block}")
-                    # Execute the code
+                    logging.info(f"[CHART DEBUG] Found plotting code block:\n{code_block}")
                     chart_result = await execute_chart_code(code_block)
                     if chart_result["success"]:
-                        # Yield the chart information as a special message
-                        yield {
-                            "type": "chart",
-                            "code": code_block,
-                            "image_path": chart_result["image_path"]
+                        logging.info(f"[CHART DEBUG] Chart generated successfully: {chart_result['image_path']}")
+                        
+                        # Create a complete HTML message that includes both code and image
+                        message = {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": f"""Here's the visualization:
+
+```python
+{code_block}
+```
+
+<div style="margin: 20px 0;">
+    <img src="{chart_result['image_path']}" alt="Generated Chart" style="max-width: 100%; height: auto; border: 1px solid #ddd; border-radius: 4px;"/>
+</div>""",
+                            "id": str(uuid.uuid4()),
+                            "created_at": ""
                         }
+                        
+                        logging.info(f"[CHART DEBUG] Sending message with chart: {message}")
+                        yield message
 
     return generate()
 
@@ -1081,49 +1112,39 @@ async def generate_title(conversation_messages) -> str:
 async def execute_chart_code(code: str) -> dict:
     try:
         # Clear any existing plots
-        matplotlib.pyplot.clf()
-        matplotlib.pyplot.close('all')
+        plt.clf()
+        plt.close('all')
         
         # Create a new figure
         plt.figure(figsize=(10, 6))
         
-        # Set up the namespace with required imports
-        namespace = {
-            'plt': matplotlib.pyplot,
-            'np': __import__('numpy'),
-            'matplotlib': matplotlib
-        }
-        
-        # Add common imports that might be needed
-        exec('import matplotlib.pyplot as plt', namespace)
-        exec('import numpy as np', namespace)
-        
-        # Execute the plotting code
-        logging.debug(f"Executing code:\n{code}")
+        # Execute the code
+        namespace = {'plt': plt, 'np': np}
         exec(code, namespace)
         
-        # Ensure tight layout
-        plt.tight_layout()
-        
-        # Generate unique filename and save
-        chart_id = str(uuid.uuid4())
-        filename = f"chart_{chart_id}.png"
+        # Save the chart with timestamp
+        timestamp = int(time.time())
+        filename = f"chart_{timestamp}.png"
         filepath = os.path.join(CHARTS_DIR, filename)
         
-        # Save with high DPI for quality
         plt.savefig(filepath, bbox_inches='tight', dpi=300)
-        logging.debug(f"Chart saved to: {filepath}")
-        
-        # Clean up
         plt.close('all')
+        
+        logging.info(f"[CHART DEBUG] Chart saved to: {filepath}")
+        logging.info(f"[CHART DEBUG] File exists: {os.path.exists(filepath)}")
+        logging.info(f"[CHART DEBUG] Directory contents: {os.listdir(CHARTS_DIR)}")
+        
+        # Return the asset path that matches our route
+        image_path = f"/assets/charts/{filename}?t={timestamp}"
+        logging.info(f"[CHART DEBUG] Image path: {image_path}")
         
         return {
             "success": True,
-            "image_path": f"/assets/charts/{filename}",
+            "image_path": image_path,
             "error": None
         }
     except Exception as e:
-        logging.exception("Error executing chart code")
+        logging.error(f"[CHART DEBUG] Error executing chart code: {str(e)}")
         return {
             "success": False,
             "error": str(e)
@@ -1190,6 +1211,40 @@ async def format_non_streaming_response(response, history_metadata={}, apim_requ
         response_obj["apim_request_id"] = apim_request_id
         
     return response_obj
+
+
+@bp.route("/.auth/me")
+async def auth_me():
+    # Return empty auth for local development
+    return jsonify([]), 200
+
+
+@bp.route("/test-chart")
+async def test_chart():
+    # Get the most recent chart file
+    chart_files = [f for f in os.listdir(CHARTS_DIR) if f.endswith('.png')]
+    if not chart_files:
+        return "No charts found", 404
+    
+    latest_chart = max(chart_files, key=lambda x: os.path.getmtime(os.path.join(CHARTS_DIR, x)))
+    logging.info(f"[TEST] Latest chart: {latest_chart}")
+    
+    # Return a simple HTML page that tries to display the image
+    return f"""
+    <html>
+        <body>
+            <h1>Test Chart Display</h1>
+            <p>Chart file: {latest_chart}</p>
+            <img src="/assets/charts/{latest_chart}" alt="Test Chart"/>
+            <p>Directory contents: {os.listdir(CHARTS_DIR)}</p>
+        </body>
+    </html>
+    """
+
+
+@bp.route('/static/<path:path>')
+async def serve_static(path):
+    return await send_from_directory('static', path)
 
 
 app = create_app()
