@@ -35,13 +35,66 @@ from backend.utils import (
     convert_to_pf_format,
     format_pf_non_streaming_response,
 )
-import matplotlib.pyplot as plt
 import io
 import base64
+from matplotlib.figure import Figure
+import matplotlib
+matplotlib.use('Agg')  # Must be called before importing pyplot
+import matplotlib.pyplot as plt
+import numpy as np
+import re
 
 bp = Blueprint("routes", __name__, static_folder="static", template_folder="static")
 
 cosmos_db_ready = asyncio.Event()
+
+CHARTS_DIR = os.path.join(os.path.dirname(__file__), "static", "charts")
+os.makedirs(CHARTS_DIR, exist_ok=True)
+
+system_message = {
+    "role": "system",
+    "content": """You are a analyst assistant that helps to generate plots.
+
+When creating visualizations, you MUST follow these EXACT rules:
+
+1. First explain what you're going to visualize
+2. Then provide ONLY the code block with NO additional instructions:
+```python
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Your plotting code here
+plt.figure(figsize=(10, 6))
+# ... rest of plotting code ...
+plt.tight_layout()
+```
+
+IMPORTANT:
+- Do NOT include plt.show()
+- Do NOT add instructions about running the code
+- Do NOT mention installing packages
+- Do NOT explain the code
+- ONLY provide the explanation and code block
+
+Example response:
+"I'll create a bar chart showing sales data by region.
+
+```python
+import matplotlib.pyplot as plt
+import numpy as np
+
+regions = ['A', 'B', 'C']
+sales = [100, 150, 200]
+
+plt.figure(figsize=(10, 6))
+plt.bar(regions, sales)
+plt.title('Sales by Region')
+plt.xlabel('Region')
+plt.ylabel('Sales')
+plt.tight_layout()
+```"
+"""
+}
 
 
 def create_app():
@@ -79,6 +132,17 @@ async def favicon():
 @bp.route("/assets/<path:path>")
 async def assets(path):
     return await send_from_directory("static/assets", path)
+
+
+@bp.route("/assets/charts/<path:filename>")
+async def serve_chart(filename):
+    logging.debug(f"Attempting to serve chart: {filename}")
+    logging.debug(f"Charts directory: {CHARTS_DIR}")
+    try:
+        return await send_from_directory(CHARTS_DIR, filename)
+    except Exception as e:
+        logging.error(f"Error serving chart {filename}: {str(e)}")
+        return {"error": str(e)}, 404
 
 
 # Debug settings
@@ -211,34 +275,8 @@ async def init_cosmosdb_client():
 
 def prepare_model_args(request_body, request_headers):
     request_messages = request_body.get("messages", [])
-    messages = []
-    if not app_settings.datasource:
-        messages = [
-            {
-                "role": "system",
-                "content": app_settings.azure_openai.system_message
-            }
-        ]
-
-    for message in request_messages:
-        if message:
-            if message["role"] == "assistant" and "context" in message:
-                context_obj = json.loads(message["context"])
-                messages.append(
-                    {
-                        "role": message["role"],
-                        "content": message["content"],
-                        "context": context_obj
-                    }
-                )
-            else:
-                messages.append(
-                    {
-                        "role": message["role"],
-                        "content": message["content"]
-                    }
-                )
-
+    messages = [system_message] + request_messages  # Now system_message is defined
+    
     user_json = None
     if (MS_DEFENDER_ENABLED):
         authenticated_user_details = get_authenticated_user_details(request_headers)
@@ -338,35 +376,74 @@ async def promptflow_request(request):
         logging.error(f"An error occurred while making promptflow_request: {e}")
 
 
-async def execute_python_plot(code: str):
-    try:
-        # Create a new figure
-        plt.figure()
-        
-        # Execute the plotting code
-        exec(code)
-        
-        # Save the plot to a bytes buffer
-        buffer = io.BytesIO()
-        plt.savefig(buffer, format='png')
-        plt.close()  # Close the figure to free memory
-        
-        # Convert to base64 string
-        buffer.seek(0)
-        image_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
-        
-        return f"data:image/png;base64,{image_base64}"
-    except Exception as e:
-        logging.exception("Error executing plot code")
-        return str(e)
-
-
 async def send_chat_request(request_body, request_headers):
     filtered_messages = []
     messages = request_body.get("messages", [])
+    
+    # Get context from vector store if available
+    context = ""
+    if app_settings.datasource and hasattr(app_settings.datasource, 'vector_store'):
+        last_user_message = next((m for m in reversed(messages) if m["role"] == "user"), None)
+        if last_user_message:
+            relevant_docs = app_settings.datasource.vector_store.similarity_search(
+                last_user_message["content"], 
+                k=3
+            )
+            context = "\n".join([doc.page_content for doc in relevant_docs])
+    
+    # Add system message with context
+    system_message = {
+        "role": "system",
+        "content": """You are a financial data analyst assistant that helps analyze financial data from PDFs.
+        
+        When creating visualizations, you MUST follow this EXACT format:
+        
+        1. First explain what you're going to visualize
+        2. Then provide the code in a Python code block with these EXACT markers:
+        ```python
+        import matplotlib.pyplot as plt
+        import numpy as np
+        
+        # Your plotting code here
+        plt.figure(figsize=(10, 6))
+        # ... rest of plotting code ...
+        plt.tight_layout()
+        ```
+        3. Do NOT include plt.show() in your code
+        4. Do NOT say "you can run this code" or similar phrases
+        5. Do NOT explain how to install packages
+        
+        Example response:
+        "Let me create a visualization of the data.
+        
+        ```python
+        import matplotlib.pyplot as plt
+        import numpy as np
+        
+        # Data
+        x = [1, 2, 3]
+        y = [4, 5, 6]
+        
+        plt.figure(figsize=(10, 6))
+        plt.plot(x, y)
+        plt.title('Sample Plot')
+        plt.xlabel('X axis')
+        plt.ylabel('Y axis')
+        plt.tight_layout()
+        ```"
+        """
+    }
+    
+    # Filter out tool messages and clean message format
+    filtered_messages = [system_message]
     for message in messages:
         if message.get("role") != 'tool':
-            filtered_messages.append(message)
+            # Only include required fields for the API
+            cleaned_message = {
+                "role": message["role"],
+                "content": message["content"]
+            }
+            filtered_messages.append(cleaned_message)
             
     request_body['messages'] = filtered_messages
     model_args = prepare_model_args(request_body, request_headers)
@@ -374,26 +451,34 @@ async def send_chat_request(request_body, request_headers):
     try:
         azure_openai_client = await init_openai_client()
         raw_response = await azure_openai_client.chat.completions.with_raw_response.create(**model_args)
+        response = raw_response.parse()
         apim_request_id = raw_response.headers.get("apim-request-id")
         
-        # Get the response object
-        response = raw_response.parse()
-        
-        # If streaming is enabled, return the response directly
-        if model_args.get('stream', False):
-            return response, apim_request_id
+        # Add detailed logging for LLM response
+        if model_args.get("stream"):
+            # For streaming responses, we'll log each chunk
+            logging.debug("Streaming response started")
+            original_response = response
             
-        # For non-streaming responses, handle plot generation
-        if hasattr(response, 'choices') and response.choices:
-            content = response.choices[0].message.content
-            if "plt.show()" in content and "import" in content:
-                image_data = await execute_python_plot(content)
-                response.choices[0].message.content += f"\n\n![Plot]({image_data})"
+            async def log_and_yield():
+                async for chunk in original_response:
+                    if hasattr(chunk, 'choices') and chunk.choices:
+                        content = chunk.choices[0].delta.content
+                        if content:
+                            logging.debug(f"Stream chunk content: {content}")
+                    yield chunk
+            response = log_and_yield()
+        else:
+            # For non-streaming responses, log the full content
+            if hasattr(response, 'choices') and response.choices:
+                content = response.choices[0].message.content
+                logging.debug(f"Complete response content: {content}")
             
-        return response, apim_request_id
     except Exception as e:
         logging.exception("Exception in send_chat_request")
         raise e
+
+    return response, apim_request_id
 
 
 async def complete_chat_request(request_body, request_headers):
@@ -416,45 +501,88 @@ async def stream_chat_request(request_body, request_headers):
     response, apim_request_id = await send_chat_request(request_body, request_headers)
     history_metadata = request_body.get("history_metadata", {})
     
+    # Collect the full message while streaming
+    full_message = ""
+    
     async def generate():
-        buffer = ""
-        async for chunk in response:
-            # Get content from the chunk
-            if hasattr(chunk.choices[0], 'delta') and hasattr(chunk.choices[0].delta, 'content'):
-                content = chunk.choices[0].delta.content or ""
-                buffer += content
-                
-                # Check if this chunk completes a matplotlib code block
-                if "plt.show()" in buffer and "import matplotlib" in buffer:
-                    try:
-                        # Extract the complete code block
-                        code_lines = buffer.split('\n')
-                        code_block = []
-                        in_code_block = False
-                        
-                        for line in code_lines:
-                            if line.strip().startswith('```'):
-                                in_code_block = not in_code_block
-                                continue
-                            if in_code_block:
-                                code_block.append(line)
-                        
-                        if code_block:
-                            code = '\n'.join(code_block)
-                            image_data = await execute_python_plot(code)
-                            content += f"\n\n![Plot]({image_data})"
-                            chunk.choices[0].delta.content = content
-                    except Exception as e:
-                        logging.exception("Error generating plot")
+        nonlocal full_message
+        async for completionChunk in response:
+            chunk_message = format_stream_response(completionChunk, history_metadata, apim_request_id)
+            # Collect the content
+            if hasattr(completionChunk, 'choices') and completionChunk.choices:
+                content = completionChunk.choices[0].delta.content
+                if content:
+                    full_message += content
+            yield chunk_message
+        
+        # After collecting all chunks, process the complete message for charts
+        if full_message:
+            logging.debug(f"Complete message collected: {full_message}")
+            # Process any code blocks in the complete message
+            code_block_matches = re.finditer(r'```(?:python)?\s*(.*?)```', full_message, re.DOTALL)
             
-            yield format_stream_response(chunk, history_metadata, apim_request_id)
+            for match in code_block_matches:
+                code_block = match.group(1).strip()
+                if any(keyword in code_block for keyword in [
+                    'matplotlib', 'pyplot', 'plt.', 
+                    'plot(', 'scatter(', 'bar(', 'hist(', 
+                    'figure(', 'title(', 'xlabel(', 'ylabel('
+                ]):
+                    logging.debug(f"Found plotting code: {code_block}")
+                    # Execute the code
+                    chart_result = await execute_chart_code(code_block)
+                    if chart_result["success"]:
+                        # Yield the chart information as a special message
+                        yield {
+                            "type": "chart",
+                            "code": code_block,
+                            "image_path": chart_result["image_path"]
+                        }
 
     return generate()
 
 
 async def conversation_internal(request_body, request_headers):
     try:
-        if app_settings.azure_openai.stream and not app_settings.base_settings.use_promptflow:
+        logging.debug("Starting conversation_internal")
+        
+        # Check for Python code in the user's message
+        if len(request_body.get("messages", [])) > 0:
+            last_message = request_body["messages"][-1]
+            
+            if last_message.get("role") == "user":
+                content = last_message.get("content", "")
+                
+                # Extract Python code from the message
+                code_match = re.search(r'```python\s*(.*?)\s*```', content, re.DOTALL)
+                if code_match:
+                    code_to_execute = code_match.group(1)
+                    
+                    # Remove plt.show() if present
+                    code_to_execute = code_to_execute.replace("plt.show()", "")
+                    code_to_execute = code_to_execute.strip()
+                    
+                    # Add tight_layout if not present
+                    if "plt.tight_layout()" not in code_to_execute:
+                        code_to_execute += "\nplt.tight_layout()"
+                    
+                    logging.debug(f"Executing code:\n{code_to_execute}")
+                    
+                    try:
+                        chart_result = await execute_chart_code(code_to_execute)
+                        if chart_result["success"]:
+                            image_url = f"/assets/charts/{os.path.basename(chart_result['image_path'])}"
+                            last_message["content"] = (
+                                f"Here's the generated plot:\n\n"
+                                f"```python\n{code_to_execute}\n```\n\n"
+                                f"![Generated Chart]({image_url})"
+                            )
+                    except Exception as e:
+                        logging.error(f"Error executing chart code: {str(e)}")
+                        last_message["content"] = f"Error generating chart: {str(e)}"
+
+        # Process through chat API
+        if app_settings.azure_openai.stream:
             result = await stream_chat_request(request_body, request_headers)
             response = await make_response(format_as_ndjson(result))
             response.timeout = None
@@ -465,7 +593,7 @@ async def conversation_internal(request_body, request_headers):
             return jsonify(result)
 
     except Exception as ex:
-        logging.exception(ex)
+        logging.exception("Exception in conversation_internal")
         if hasattr(ex, "status_code"):
             return jsonify({"error": str(ex)}), ex.status_code
         else:
@@ -948,6 +1076,120 @@ async def generate_title(conversation_messages) -> str:
     except Exception as e:
         logging.exception("Exception while generating title", e)
         return messages[-2]["content"]
+
+
+async def execute_chart_code(code: str) -> dict:
+    try:
+        # Clear any existing plots
+        matplotlib.pyplot.clf()
+        matplotlib.pyplot.close('all')
+        
+        # Create a new figure
+        plt.figure(figsize=(10, 6))
+        
+        # Set up the namespace with required imports
+        namespace = {
+            'plt': matplotlib.pyplot,
+            'np': __import__('numpy'),
+            'matplotlib': matplotlib
+        }
+        
+        # Add common imports that might be needed
+        exec('import matplotlib.pyplot as plt', namespace)
+        exec('import numpy as np', namespace)
+        
+        # Execute the plotting code
+        logging.debug(f"Executing code:\n{code}")
+        exec(code, namespace)
+        
+        # Ensure tight layout
+        plt.tight_layout()
+        
+        # Generate unique filename and save
+        chart_id = str(uuid.uuid4())
+        filename = f"chart_{chart_id}.png"
+        filepath = os.path.join(CHARTS_DIR, filename)
+        
+        # Save with high DPI for quality
+        plt.savefig(filepath, bbox_inches='tight', dpi=300)
+        logging.debug(f"Chart saved to: {filepath}")
+        
+        # Clean up
+        plt.close('all')
+        
+        return {
+            "success": True,
+            "image_path": f"/assets/charts/{filename}",
+            "error": None
+        }
+    except Exception as e:
+        logging.exception("Error executing chart code")
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+async def format_non_streaming_response(response, history_metadata={}, apim_request_id=None):
+    message_content = response.choices[0].message.content
+    logging.debug(f"Original message content: {message_content}")
+    
+    # Normalize the message content
+    message_content = message_content.strip()
+    
+    # Step 2: Identify code blocks
+    code_block_matches = re.finditer(r'```(?:python)?\s*(.*?)```', message_content, re.DOTALL)
+    
+    found_code_blocks = False
+    for match in code_block_matches:
+        found_code_blocks = True
+        code_block = match.group(1).strip()
+        logging.debug(f"Extracted code block: {code_block}")
+        
+        # Remove plt.show() if present
+        code_block = code_block.replace("plt.show()", "")
+        
+        # Step 3: Validate code content
+        if any(keyword in code_block for keyword in [
+            'matplotlib', 'pyplot', 'plt.', 
+            'plot(', 'scatter(', 'bar(', 'hist(', 
+            'figure(', 'title(', 'xlabel(', 'ylabel('
+        ]):
+            logging.debug(f"Found plotting code: {code_block}")
+            
+            # Step 4: Execute the code
+            chart_result = await execute_chart_code(code_block)
+            
+            # Step 5: Handle execution results
+            if chart_result["success"]:
+                message_content = message_content.replace(
+                    match.group(0),
+                    f"```python\n{code_block}\n```\n\n![Generated Chart]({chart_result['image_path']})"
+                )
+                logging.debug(f"Updated message with chart: {message_content}")
+            else:
+                logging.error(f"Failed to execute code: {chart_result['error']}")
+    
+    if not found_code_blocks:
+        logging.warning("No code blocks found in the message content.")
+    
+    # Step 6: Log and debug
+    logging.debug(f"Final message content: {message_content}")
+    
+    response_obj = {
+        "id": str(uuid.uuid4()),
+        "role": response.choices[0].message.role,
+        "content": message_content,
+        "created_at": "",
+    }
+    
+    if history_metadata:
+        response_obj["metadata"] = history_metadata
+    
+    if apim_request_id:
+        response_obj["apim_request_id"] = apim_request_id
+        
+    return response_obj
 
 
 app = create_app()
